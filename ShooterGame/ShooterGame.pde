@@ -7,33 +7,41 @@
  * ARCHITECTURE OVERVIEW:
  * - State Machine: Controlled via `gameState` (0=Menu, 1=Playing, 2=GameOver).
  * - Entity Component: Game objects handled via ArrayLists (enemies, bullets, particles).
- * - Hardware Integration: Ready to receive real-world joystick input via Serial (Arduino).
+ * - Hardware Integration: Receives real-world joystick input via Serial (Arduino).
+ * - Active Input Switching: Seamlessly hot-swaps between keyboard and joystick at runtime.
  * 
  * HOW TO USE HARDWARE:
  * 1. Set `useSerial = true`
  * 2. Ensure Arduino is printing string payloads: "X_VAL,Y_VAL,BUTTON_STATE\n"
  * 3. Match the Serial baud rate (9600 default).
+ * 4. Both keyboard and joystick work simultaneously - last used input takes control.
  * ============================================================================
  */
 import processing.serial.*;  // Handles Arduino/Joystick communication
 import processing.sound.*;   // Handles procedural audio generation
-boolean useSerial = false;
+boolean useSerial = true; // Enabled for IoT hardware presentation
 
 Serial myPort;  // Serial port for joystick
 float playerX, playerY;  // Player position
 float playerSize = 40;   // Size of the player's aircraft
 int gameState = 0;       // 0 = Main Menu, 1 = Playing, 2 = Game Over
+int stateTransitionCooldown = 0; // Prevent instant restarts when spamming button
 
 // --- Phase 1: Game State Variables ---
 int score = 0;
 int highScore = 0; // High score tracker
 int lives = 3;
 int level = 1;
+int lastLevel = 1;      // To detect level up events
+int levelUpTimer = 0;   // Frames to show level up overlay
+boolean isPaused = false; // Pause state
+int countdownTimer = 0;   // 3-2-1 counter for game starts
 
-// --- Keyboard control state ---
+// --- Input control state ---
 boolean keyLeft = false, keyRight = false, keyUp = false, keyDown = false;
 boolean spaceHeld = false;
 int shootCooldown = 0;  // Prevent bullet spam
+boolean usingJoystick = false; // Active Input Switching: true = joystick controls ship, false = keyboard
 
 // --- Sound Objects ---
 SqrOsc playerLaser;
@@ -69,9 +77,16 @@ void setup() {
 
   if (useSerial) {
     // Safety: Check that a serial port actually exists before attempting connection
+    printArray(Serial.list()); // List all ports to console to help identify Arduino
     if (Serial.list().length > 0) {
-      myPort = new Serial(this, Serial.list()[0], 9600);
-      myPort.bufferUntil('\n');
+      try {
+        myPort = new Serial(this, Serial.list()[0], 9600);
+        myPort.bufferUntil('\n');
+        println("Serial connected on: " + Serial.list()[0]);
+      } catch (Exception e) {
+        println("ERROR: Could not open serial port (may be in use). Falling back to keyboard.");
+        useSerial = false;
+      }
     } else {
       println("WARNING: No serial ports found. Falling back to keyboard mode.");
       useSerial = false;
@@ -94,6 +109,7 @@ void setup() {
     stars[i] = new Star();
   }
 
+  loadHighScore();   // Read from disk
   initializeGame();  // Initialize variables
   gameState = 0;     // Force start at the main menu
 }
@@ -113,33 +129,75 @@ void draw() {
     s.show();
   }
 
+  // Decrement cooldowns BEFORE any early returns so they work on all screens
+  if (stateTransitionCooldown > 0) stateTransitionCooldown--;
+
+  // Handle Pause UI - Render early to skip gameplay logic
+  if (gameState == 1 && isPaused) {
+    drawPausedOverlay();
+    return;
+  }
+
   if (gameState == 0) {
     // --- MAIN MENU SCREEN ---
-    fill(0, 255, 255);
+    
+    // Dramatic glow behind title
+    noStroke();
+    fill(0, 255, 255, 20 + sin(frameCount * 0.05) * 15);
+    ellipse(width / 2, height / 2 - 80, 500, 120);
+    
+    // Title with shadow for depth
     textAlign(CENTER, CENTER);
-    textSize(50);
+    textSize(52);
+    fill(0, 80, 80);
+    text("SPACE DEFENDER", width / 2 + 3, height / 2 - 77); // Shadow
+    fill(0, 255, 255);
     text("SPACE DEFENDER", width / 2, height / 2 - 80);
+    
+    // Subtitle
+    fill(100, 200, 255, 180);
+    textSize(14);
+    text("IOT ARCADE EXPERIENCE", width / 2, height / 2 - 52);
     
     // High Score Display
     fill(255, 200, 0);
     textSize(18);
-    if (highScore > 0) text("HIGH SCORE: " + nf(highScore, 6), width / 2, height / 2 - 45);
+    if (highScore > 0) text("HIGH SCORE: " + nf(highScore, 6), width / 2, height / 2 - 30);
     
-    // Controls
+    // Divider line
+    stroke(0, 255, 255, 60);
+    strokeWeight(1);
+    line(width / 2 - 150, height / 2 - 15, width / 2 + 150, height / 2 - 15);
+    noStroke();
+    
+    // Controls - show both input methods
     fill(200);
-    textSize(16);
-    text("WASD / ARROWS to Move", width / 2, height / 2 - 10);
-    text("SPACE to Shoot", width / 2, height / 2 + 15);
+    textSize(15);
+    text("KEYBOARD: WASD / Arrows + SPACE to Shoot", width / 2, height / 2 + 5);
+    fill(150, 255, 150);
+    text("JOYSTICK: Analog Stick + Button to Shoot", width / 2, height / 2 + 28);
     
     // Add pulsing effect for start text
-    fill(255, 255, 100, map(sin(frameCount * 0.1), -1, 1, 50, 255)); // Glowing yellow
-    textSize(24);
-    text("PRESS SPACE TO START", width / 2, height / 2 + 80);
+    float pulse = map(sin(frameCount * 0.08), -1, 1, 80, 255);
+    fill(255, 255, 100, pulse);
+    textSize(26);
+    text("PRESS SPACE / JOYSTICK BUTTON", width / 2, height / 2 + 80);
     
-    // Aesthetic decorative ship at bottom
+    // Animated arrow indicators pointing at the start text
+    float arrowBounce = sin(frameCount * 0.1) * 5;
+    fill(255, 255, 100, pulse * 0.6);
+    triangle(width / 2 - 200, height / 2 + 80 + arrowBounce, width / 2 - 190, height / 2 + 74 + arrowBounce, width / 2 - 190, height / 2 + 86 + arrowBounce);
+    triangle(width / 2 + 200, height / 2 + 80 + arrowBounce, width / 2 + 190, height / 2 + 74 + arrowBounce, width / 2 + 190, height / 2 + 86 + arrowBounce);
+    
+    // Aesthetic decorative ship at bottom with enhanced presentation
     pushMatrix();
     translate(width / 2, height - 100 + sin(frameCount * 0.05) * 10); // Hover effect
     noStroke();
+    
+    // Engine glow underneath
+    fill(255, 100, 0, 40);
+    ellipse(0, 50, 60, 40);
+    
     fill(255, random(150, 255), 0); triangle(-8, 35, 8, 35, 0, 55 + random(-10, 10)); // Flame
     fill(150); triangle(0, 0, -25, 35, 25, 35); // Wings
     fill(100); rectMode(CENTER); rect(-25, 35, 6, 20); rect(25, 35, 6, 20); // Guns
@@ -168,40 +226,77 @@ void draw() {
   }
 
   if (gameState == 2) {
-    // Show "Game Over" screen - Semi transparent overlay
-    fill(0, 0, 0, 150);
+    // Show "Game Over" screen - Cinematic dark overlay
+    fill(0, 0, 0, 180);
     rectMode(CORNER);
     noStroke();
     rect(0, 0, width, height);
 
-    fill(255, 50, 50);
+    // Red vignette effect
+    for (int i = 0; i < 5; i++) {
+      fill(255, 0, 0, 8 - i * 1.5);
+      rect(i * 20, i * 20, width - i * 40, height - i * 40);
+    }
+
+    // Title shadow + text
     textAlign(CENTER, CENTER);
-    textSize(60);
-    text("GAME OVER", width / 2, height / 2 - 60);
+    textSize(64);
+    fill(80, 0, 0);
+    text("GAME OVER", width / 2 + 3, height / 2 - 77);
+    fill(255, 50, 50);
+    text("GAME OVER", width / 2, height / 2 - 80);
+    
+    // Divider
+    stroke(255, 50, 50, 80);
+    strokeWeight(1);
+    line(width / 2 - 120, height / 2 - 45, width / 2 + 120, height / 2 - 45);
+    noStroke();
     
     fill(255);
-    textSize(30);
-    text("Final Score: " + score, width / 2, height / 2);
+    textSize(28);
+    text("FINAL SCORE: " + nf(score, 6), width / 2, height / 2 - 20);
     
-    fill(255, 200, 0);
-    textSize(20);
-    text("High Score: " + highScore, width / 2, height / 2 + 40);
+    // NEW HIGH SCORE callout - only if score actually beat the record
+    if (score > 0 && score > highScore) {
+      float glow = map(sin(frameCount * 0.15), -1, 1, 150, 255);
+      fill(255, 200, 0, glow);
+      textSize(22);
+      text("\u2605 NEW HIGH SCORE! \u2605", width / 2, height / 2 + 15);
+    } else {
+      fill(255, 200, 0, 180);
+      textSize(18);
+      text("High Score: " + nf(highScore, 6), width / 2, height / 2 + 15);
+    }
     
     fill(0, 255, 255);
-    textSize(18);
-    text("Level Reached: " + level, width / 2, height / 2 + 70);
+    textSize(16);
+    text("Level Reached: " + level, width / 2, height / 2 + 45);
     
-    fill(200);
+    // Pulsing restart prompt
+    float restartPulse = map(sin(frameCount * 0.08), -1, 1, 100, 255);
+    fill(200, 200, 200, restartPulse);
     textSize(18);
-    text("Press R to Restart", width / 2, height / 2 + 110);
+    text("Press R / Joystick Button to Restart", width / 2, height / 2 + 90);
     return;
   }
   
-  // Update level based on score (Difficulty scaling) - Capped to level 10 so it doesn't become impossible
+  if (gameState == 1 && countdownTimer > 0) {
+    countdownTimer--;
+    drawCountdownOverlay();
+    // Do NOT return here — we want stars and particles to keep moving
+  }
+
+  // Update level based on score (Difficulty scaling) - Capped to level 10
   level = min(10, 1 + (score / 100));
 
-  if (!useSerial) {
-    // Smooth velocity-based movement 
+  // Detect Level Up for visual feedback
+  if (level > lastLevel) {
+    levelUpTimer = 120; // Show for 2 seconds
+    lastLevel = level;
+  }
+
+  if (gameState == 1 && countdownTimer <= 0 && !usingJoystick) {
+    // --- KEYBOARD MODE: Smooth velocity-based movement ---
     float accel = 0.8;
     float maxSpeed = 6.0;
     float friction = 0.85; // Sliding friction
@@ -225,19 +320,20 @@ void draw() {
     // Constrain player to screen bounds (Y is restricted to bottom half to prevent unfair instant spawn-deaths)
     playerX = constrain(playerX, 20, width - 20);
     playerY = constrain(playerY, height / 2, height - 20);
+  }
+  // NOTE: Joystick mode movement is handled directly in serialEvent() via absolute positioning
 
-    // Shoot with cooldown
-    if (spaceHeld && shootCooldown <= 0) {
-      playerBullets.add(new PlayerBullet(playerX, playerY));
-      playerMuzzleFlash = 5; // Set flash duration
-      
-      // Play procedural high-pitch laser sound
-      playerLaser.freq(random(800, 1000));
-      playerLaser.play();
-      envPLaser.play(playerLaser, 0.01, 0.05, 0.1, 0.1);
-      
-      shootCooldown = 12;
-    }
+  // Unified shooting for BOTH input modes (spaceHeld is set by keyboard OR joystick button)
+  if (spaceHeld && shootCooldown <= 0 && countdownTimer <= 0) {
+    playerBullets.add(new PlayerBullet(playerX, playerY));
+    playerMuzzleFlash = 5; // Set flash duration
+    
+    // Play procedural high-pitch laser sound
+    playerLaser.freq(random(800, 1000));
+    playerLaser.play();
+    envPLaser.play(playerLaser, 0.01, 0.05, 0.1, 0.1);
+    
+    shootCooldown = 12;
   }
   // Decrement shoot cooldown OUTSIDE input-mode block so it works for BOTH keyboard and joystick
   if (shootCooldown > 0) shootCooldown--;
@@ -259,6 +355,16 @@ void draw() {
   if (invincibilityTimer > 0) {
     invincibilityTimer--;
     if (frameCount % 10 < 5) isVisible = false; // Blink effect
+    
+    // Draw energy shield glow around ship (visible even during blink-off frames)
+    float shieldPulse = map(sin(frameCount * 0.3), -1, 1, 80, 180);
+    fill(0, 200, 255, shieldPulse * 0.3);
+    ellipse(0, 15, 70, 75);
+    stroke(0, 200, 255, shieldPulse);
+    strokeWeight(1.5);
+    noFill();
+    ellipse(0, 15, 65, 70);
+    noStroke();
   }
 
   if (isVisible) {
@@ -296,69 +402,71 @@ void draw() {
   }
   popMatrix();
 
-  // Update and draw enemies
-  for (int i = enemies.size() - 1; i >= 0; i--) {
-    Enemy e = enemies.get(i);
-    e.update();
-    e.show();
-    if (e.isOffScreen()) {
-      enemies.remove(i);  // Remove enemies that leave the screen
-      // Optional: penalty for letting enemies pass?
-      // score = max(0, score - 5); 
+  // Logic updates should only happen if not in countdown
+  if (gameState == 1 && countdownTimer <= 0) {
+    // Update and draw enemies
+    for (int i = enemies.size() - 1; i >= 0; i--) {
+      Enemy e = enemies.get(i);
+      e.update();
+      e.show();
+      if (e.isOffScreen()) {
+        enemies.remove(i);
+      }
     }
-  }
 
-  // Update and draw enemy bullets
-  for (int i = bullets.size() - 1; i >= 0; i--) {
-    Bullet b = bullets.get(i);
-    b.update();
-    b.show();
-    if (b.isOffScreen()) {
-      bullets.remove(i);  // Remove bullets that leave the screen
-    } else if (invincibilityTimer <= 0 && b.hitsPlayer(playerX, playerY, playerSize)) {
-      // Hit by bullet
-      lives--;
-      bullets.remove(i); // Destroy the bullet so it doesn't hit multiple times
-      
-      // Distinct harsh damage sound
-      hurtSound.freq(random(150, 200));
-      hurtSound.play();
-      envHurt.play(hurtSound, 0.01, 0.1, 0.5, 0.2); // Louder and sharper than explosion
-      
-      // Also spawn visual explosion on the player
-      createExplosion(playerX, playerY);
-      
-      screenShake = 15;  // Powerful screen shake
-      invincibilityTimer = 90; // 1.5 seconds of i-frames (assuming 60 FPS)
-      if (lives <= 0) {
-        if (score > highScore) highScore = score;
-        gameState = 2; // Game Over
+    // Update and draw enemy bullets
+    for (int i = bullets.size() - 1; i >= 0; i--) {
+      Bullet b = bullets.get(i);
+      b.update();
+      b.show();
+      if (b.isOffScreen()) {
+        bullets.remove(i);
+      } else if (invincibilityTimer <= 0 && b.hitsPlayer(playerX, playerY, playerSize)) {
+        lives--;
+        bullets.remove(i);
+        hurtSound.freq(random(150, 200));
+        hurtSound.play();
+        envHurt.play(hurtSound, 0.01, 0.1, 0.5, 0.2);
+        createExplosion(playerX, playerY);
+        screenShake = 15;
+        invincibilityTimer = 90;
+        if (lives <= 0) {
+          if (score > 0 && score > highScore) { highScore = score; saveHighScore(); }
+          gameState = 2; stateTransitionCooldown = 60;
+        }
       }
-      break;  // Exit the loop for this frame to prevent multiple hits at once
     }
-  }
-  
-  // Also check if enemy crashes directly into player
-  for (int i = enemies.size() - 1; i >= 0; i--) {
-    Enemy e = enemies.get(i);
-    if (invincibilityTimer <= 0 && dist(playerX, playerY, e.x, e.y) < (playerSize + e.size) / 2) {
-      lives--;
-      
-      // Harsh damage sound
-      hurtSound.freq(random(100, 150));
-      hurtSound.play();
-      envHurt.play(hurtSound, 0.01, 0.1, 0.6, 0.3);
-      
-      createExplosion(e.x, e.y); // Explosion for enemy crashing
-      enemies.remove(i);
-      screenShake = 20; // Massive camera shake on crash
-      invincibilityTimer = 90;
-      if (lives <= 0) {
-        if (score > highScore) highScore = score;
-        gameState = 2; // Game Over
+
+    // Check if enemy crashes directly into player
+    for (int i = enemies.size() - 1; i >= 0; i--) {
+      Enemy e = enemies.get(i);
+      if (invincibilityTimer <= 0 && dist(playerX, playerY, e.x, e.y) < (playerSize + e.size) / 2) {
+        lives--;
+        hurtSound.freq(random(100, 150));
+        hurtSound.play();
+        envHurt.play(hurtSound, 0.01, 0.1, 0.6, 0.3);
+        createExplosion(e.x, e.y);
+        enemies.remove(i);
+        screenShake = 20;
+        invincibilityTimer = 90;
+        if (lives <= 0) {
+          if (score > 0 && score > highScore) { highScore = score; saveHighScore(); }
+          gameState = 2; stateTransitionCooldown = 60;
+        }
       }
-      break;
     }
+
+    // Spawn Logic
+    spawnTimer++;
+    int spawnRate = max(20, 60 - (level * 5)); 
+    if (spawnTimer > spawnRate) {  
+      enemies.add(new Enemy());
+      spawnTimer = 0;
+    }
+  } else if (gameState == 1) {
+    // During countdown, just show existing entities (static)
+    for (Enemy e : enemies) e.show();
+    for (Bullet b : bullets) b.show();
   }
 
   // Update and draw player bullets
@@ -372,9 +480,12 @@ void draw() {
     // Check if the bullet hits any enemy
     for (int j = enemies.size() - 1; j >= 0; j--) {
       if (pb.hitsEnemy(enemies.get(j))) {
-        createExplosion(enemies.get(j).x, enemies.get(j).y); // Create explosion visually
+        Enemy hitEnemy = enemies.get(j);
+        createExplosion(hitEnemy.x, hitEnemy.y); // Create explosion visually
+        // Note: flashTimer is NOT set here because the enemy is destroyed immediately.
+        
         // Floating score popup!
-        popups.add(new FloatingText(enemies.get(j).x, enemies.get(j).y - 15, "+10"));
+        popups.add(new FloatingText(hitEnemy.x, hitEnemy.y - 15, "+10"));
         
         enemies.remove(j);        // Remove the enemy
         playerBullets.remove(i);  // Remove the player bullet
@@ -400,21 +511,14 @@ void draw() {
     if (ft.isDead()) popups.remove(i);
   }
 
-  // Spawn new enemies periodically
-  spawnTimer++;
-  // Spawn rate scales with level (harder = lower wait time)
-  int spawnRate = max(20, 60 - (level * 5)); 
-  if (spawnTimer > spawnRate) {  
-    enemies.add(new Enemy());
-    spawnTimer = 0;
-  }
+  // Spawn Logic moved into non-countdown block above
   
-  // --- HUD (Heads Up Display) ---
-  // Semi-transparent background panel for readability
-  fill(0, 0, 0, 150);
-  noStroke();
-  rectMode(CORNER);
-  rect(0, 0, width, 50);
+  // HUD gradient: fade from opaque at top to transparent — only 6 bands for performance
+  for (int i = 0; i < 6; i++) {
+    fill(0, 0, 0, map(i, 0, 5, 190, 0));
+    rectMode(CORNER);
+    rect(0, i * 9, width, 10); // 10px tall bands covering the ~55px HUD zone
+  }
 
   fill(0, 255, 255); // Cyan text for futuristic vibe
   textAlign(LEFT, TOP);
@@ -430,22 +534,109 @@ void draw() {
   fill(255, 200, 0); // Gold text for level
   textAlign(RIGHT, TOP);
   text("LEVEL " + level, width - 15, 15);
+  
+  // Input mode indicator
+  textSize(10);
+  fill(100, 100, 100);
+  textAlign(RIGHT, TOP);
+  text(usingJoystick ? "[JOYSTICK]" : "[KEYBOARD]", width - 15, 38);
+
+  // --- LEVEL UP OVERLAY ---
+  if (levelUpTimer > 0) {
+    levelUpTimer--;
+    float progress = levelUpTimer / 120.0;
+    float alpha = progress * 255;
+    
+    // Screen flash on level up (only first few frames)
+    if (levelUpTimer > 110) {
+      fill(255, 255, 100, (levelUpTimer - 110) * 25);
+      rectMode(CORNER);
+      rect(0, 0, width, height);
+    }
+    
+    // Scaling text effect: text starts big and eases to resting size
+    // Clamp scaleEffect to max 1.8 so text never becomes enormous
+    float scaleEffect = constrain(1.0 + (progress > 0.8 ? (progress - 0.8) * 5.0 : 0), 1.0, 1.8);
+    
+    textAlign(CENTER, CENTER);
+    
+    // Glow behind text
+    fill(255, 200, 0, alpha * 0.2);
+    ellipse(width / 2, height / 2 - 30, 350 * scaleEffect, 100 * scaleEffect);
+    
+    textSize(55 * scaleEffect);
+    fill(255, 255, 100, alpha);
+    text("LEVEL " + level, width / 2, height / 2 - 40);
+    
+    textSize(18);
+    fill(255, 200, 100, alpha * 0.8);
+    text("DIFFICULTY INCREASED", width / 2, height / 2 + 10);
+  }
+  
+  // Final safeguard: ensure pause indicator is visible on HUD
+  if (isPaused) {
+    drawPausedOverlay();
+  }
+}
+
+/**
+ * UI: PAUSE OVERLAY
+ */
+void drawPausedOverlay() {
+  fill(0, 0, 0, 150);
+  rectMode(CORNER);
+  rect(0, 0, width, height);
+  
+  textAlign(CENTER, CENTER);
+  textSize(60);
+  fill(0, 255, 255);
+  text("PAUSED", width / 2, height / 2 - 20);
+  
+  textSize(20);
+  fill(200);
+  text("PRESS 'P' TO RESUME", width / 2, height / 2 + 30);
+}
+
+/**
+ * UI: COUNTDOWN OVERLAY
+ */
+void drawCountdownOverlay() {
+  int seconds = (countdownTimer / 60) + 1;
+  String display = str(seconds);
+  if (countdownTimer < 40) display = "GO!";
+  
+  // Pulsing scale for numbers
+  float s = 1.0 + (countdownTimer % 60) / 40.0;
+  if (countdownTimer < 40) s = 1.0 + (40 - countdownTimer) / 20.0;
+  
+  textAlign(CENTER, CENTER);
+  textSize(80 * s);
+  fill(255, 255, 100, map(s, 1, 2, 255, 0));
+  text(display, width / 2, height / 2);
 }
 
 // --- Keyboard input handlers ---
 void keyPressed() {
-  if (gameState == 0 && key == ' ') {
+  if (gameState == 0 && key == ' ' && stateTransitionCooldown <= 0) {
     initializeGame();
     return;
   }
 
-  if (gameState == 2 && (key == 'r' || key == 'R')) {
+  if (gameState == 2 && (key == 'r' || key == 'R') && stateTransitionCooldown <= 0) {
     initializeGame();
     return;
   }
 
-  // Only process gameplay keys when actually playing (prevents ghost inputs from menu/game-over)
   if (gameState != 1) return;
+
+  // Handle Pause Toggle
+  if (key == 'p' || key == 'P') {
+    isPaused = !isPaused;
+    return;
+  }
+
+  // Any gameplay key press instantly switches to keyboard mode
+  usingJoystick = false;
 
   if (key == CODED) {
     if (keyCode == LEFT)  keyLeft  = true;
@@ -463,6 +654,9 @@ void keyPressed() {
 }
 
 void keyReleased() {
+  // Only process key releases during gameplay to prevent stale key states
+  if (gameState != 1) return;
+
   if (key == CODED) {
     if (keyCode == LEFT)  keyLeft  = false;
     if (keyCode == RIGHT) keyRight = false;
@@ -483,6 +677,17 @@ void keyReleased() {
  * Automatically triggered by Processing whenever new data arrives on the Serial port.
  * Parses the incoming string chunk ("X,Y,BTN\n") into usable data,
  * maps raw potentiometer values (0-1023) to screen coordinates, and triggers analog actions.
+ * 
+ * INPUT SWITCHING LOGIC:
+ * - If the joystick analog stick is moved outside a center deadzone, `usingJoystick` is set to true
+ *   and the ship locks onto the joystick's absolute position.
+ * - If a keyboard key is pressed (handled in keyPressed()), `usingJoystick` is set to false
+ *   and the ship returns to velocity-based keyboard physics.
+ * 
+ * BUTTON MAPPING (single joystick button handles all actions):
+ * - Menu Screen (gameState 0): Button press = Start Game
+ * - Playing    (gameState 1): Button held  = Fire bullets
+ * - Game Over  (gameState 2): Button press = Restart Game
  */
 void serialEvent(Serial myPort) {
   if (!useSerial) return;
@@ -505,36 +710,44 @@ void serialEvent(Serial myPort) {
       // Clamp raw input to valid ADC range before mapping to prevent out-of-bounds coordinates
       parsedX = constrain(parsedX, 0, 1023);
       parsedY = constrain(parsedY, 0, 1023);
-      float xValue = map(parsedX, 0, 1023, 0, width);
-      float yValue = map(parsedY, 0, 1023, height / 2, height);
 
-      if (gameState == 0 && buttonState == 0) {
+      // --- BUTTON MAPPING: Single button handles Start, Fire, and Restart ---
+      // Menu: Button press starts the game
+      if (gameState == 0 && buttonState == 0 && stateTransitionCooldown <= 0) {
         initializeGame();
         return;
       }
-      if (gameState == 2 && buttonState == 0) {
+      // Game Over: Button press restarts the game
+      if (gameState == 2 && buttonState == 0 && stateTransitionCooldown <= 0) {
         initializeGame();
         return;
       }
 
       if (gameState == 1) {
-        float oldX = playerX; // Track old X for banking math
-        playerX = constrain(xValue, 20, width - 20);
-        playerY = constrain(yValue, height / 2, height - 20);
+        // --- JOYSTICK DEADZONE DETECTION for Active Input Switching ---
+        // If the stick is pushed away from center (512), switch to joystick mode.
+        // Deadzone prevents tiny analog drift from stealing control from keyboard.
+        float joystickDeadzone = 30; // Adjust if your stick is loose/tight
+        boolean stickMoved = (abs(parsedX - 512) > joystickDeadzone) || (abs(parsedY - 512) > joystickDeadzone);
         
-        // Update playerVX so the ship automatically banks (tilts) while using the joystick
-        playerVX = playerX - oldX;
-
-        // Shoot with cooldown to prevent serial-event flood from overflowing bullets
-        if (buttonState == 0 && shootCooldown <= 0) {
-          playerBullets.add(new PlayerBullet(playerX, playerY));
-          playerMuzzleFlash = 5; // Set flash duration
-          shootCooldown = 12; // Match keyboard cooldown
-          // Joystick trigger sound
-          playerLaser.freq(random(800, 1000));
-          playerLaser.play();
-          envPLaser.play(playerLaser, 0.01, 0.05, 0.1, 0.1);
+        if (stickMoved) {
+          usingJoystick = true; // Joystick takes control
+          
+          // Map joystick to absolute screen position (your deliberate game mechanic)
+          float xValue = map(parsedX, 0, 1023, 0, width);
+          float yValue = map(parsedY, 0, 1023, height / 2, height);
+          
+          float oldX = playerX; // Track old X for banking math
+          playerX = constrain(xValue, 20, width - 20);
+          playerY = constrain(yValue, height / 2, height - 20);
+          
+          // Update playerVX so the ship automatically banks (tilts) while using the joystick
+          playerVX = playerX - oldX;
         }
+
+        // --- PAUSE TOGGLE via Joystick? (Optional: if the user holds stick still and presses button? No, let's stick to 'P') ---
+        // spaceHeld handles shooting but only if not paused
+        if (!isPaused) spaceHeld = (buttonState == 0);
       }
     } catch (Exception e) {
       // Catch any unexpected parseInt/parseFloat failures from corrupted serial data
@@ -566,6 +779,7 @@ void initializeGame() {
   spaceHeld = false;
   keyLeft = false; keyRight = false; keyUp = false; keyDown = false;
   playerVX = 0; playerVY = 0;
+  usingJoystick = false; // Default to keyboard on fresh game start
   
   // Reset all visual effect states to prevent carry-over between games
   invincibilityTimer = 0;
@@ -577,6 +791,31 @@ void initializeGame() {
   score = 0;
   lives = 3;
   level = 1;
+  lastLevel = 1;
+  levelUpTimer = 0;
+  
+  isPaused = false;
+  countdownTimer = 180; // 3 second countdown
+}
+
+/**
+ * FILE I/O: HIGH SCORE PERSISTENCE
+ */
+void loadHighScore() {
+  try {
+    String[] lines = loadStrings("data/highscore.txt");
+    if (lines != null && lines.length > 0) {
+      highScore = int(lines[0]);
+    }
+  } catch (Exception e) {
+    println("No highscore file found - starting fresh.");
+    highScore = 0;
+  }
+}
+
+void saveHighScore() {
+  String[] lines = { str(highScore) };
+  saveStrings("data/highscore.txt", lines);
 }
 
 /**
@@ -607,21 +846,40 @@ void createExplosion(float ex, float ey) {
  * to ensure organic, unpredictable bullet patterns across multiple entities.
  */
 class Enemy {
-  float x, y, size;
   float speed;
   int shootOffset; // For desynchronized shooting
+  int flashTimer = 0; // Visual feedback when hit
+  int type; // 0 = Straight, 1 = Weaver
+  float waveOffset; // For movement math
 
   Enemy() {
-    x = random(20, width - 20);
+    x = random(40, width - 40);
     y = -40;
     size = 40;
+    
+    // Type chance increases with level
+    float weaverChance = map(level, 1, 10, 0.05, 0.6);
+    type = (random(1) < weaverChance) ? 1 : 0;
+    
     // Speed scales with level
     speed = 1.0 + (level * 0.2); 
+    if (type == 1) speed *= 1.2; // Weavers are a bit faster downward
+    
+    waveOffset = random(TWO_PI);
     shootOffset = int(random(0, 60)); // Randomize shoot timing
   }
 
   void update() {
     y += speed; 
+    
+    if (type == 1) {
+      // Weaver movement
+      x += sin(frameCount * 0.08 + waveOffset) * 3;
+      x = constrain(x, 20, width - 20);
+    }
+    
+    if (flashTimer > 0) flashTimer--;
+
     // Shoot frequency scales with level as well
     int shootChance = max(30, 90 - (level * 5));
     if (y > 20 && (frameCount + shootOffset) % shootChance == 0) {  
@@ -644,16 +902,24 @@ class Enemy {
     triangle(x - 6, y - 10, x + 6, y - 10, x, y - 30 - random(5));
 
     // Enemy Core/Body
-    fill(200, 50, 50); // Dark red
+    if (flashTimer > 0) fill(255); // Flash bright white on impact
+    else {
+      if (type == 1) fill(150, 50, 250); // Purple for Weaver
+      else fill(200, 50, 50); // Dark red for Normal
+    }
     ellipse(x, y, size * 0.8, size);
     
     // Enemy wings
-    fill(150, 30, 30);
+    if (flashTimer > 0) fill(255); 
+    else {
+      if (type == 1) fill(100, 30, 180);
+      else fill(150, 30, 30);
+    }
     triangle(x - size * 0.4, y, x - size * 0.8, y - size * 0.4, x - size * 0.4, y + size * 0.3);
     triangle(x + size * 0.4, y, x + size * 0.8, y - size * 0.4, x + size * 0.4, y + size * 0.3);
 
     // Enemy Cockpit
-    fill(50, 255, 50); // Greenish alien window
+    if (flashTimer > 0) fill(255); else fill(50, 255, 50); // Greenish alien window
     ellipse(x, y + 5, size * 0.4, size * 0.2);
   }
 
@@ -885,23 +1151,32 @@ class FloatingText {
   float x, y;
   float textLife;
   String message;
+  float scale; // Scale animation
 
   FloatingText(float startX, float startY, String msg) {
     x = startX + random(-10, 10);
     y = startY;
     message = msg;
     textLife = 255.0;
+    scale = 2.0; // Start big, shrink to 1.0
   }
 
   void update() {
-    y -= 1.0; // Float upwards slowly
-    textLife -= 5.0; // Fade out gradually
+    y -= 1.5; // Float upwards
+    textLife -= 4.0; // Fade out gradually
+    scale = lerp(scale, 1.0, 0.15); // Smooth scale down
   }
 
   void show() {
-    fill(0, 255, 255, textLife); // Cyan glow matching the HUD
+    // Glow effect behind text
+    fill(0, 255, 255, textLife * 0.3);
     textAlign(CENTER, CENTER);
-    textSize(16);
+    textSize(18 * scale);
+    text(message, x, y);
+    
+    // Crisp foreground text
+    fill(255, 255, 255, textLife);
+    textSize(16 * scale);
     text(message, x, y);
   }
 
