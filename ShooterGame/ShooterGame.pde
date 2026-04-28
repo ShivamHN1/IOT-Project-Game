@@ -11,7 +11,7 @@
  * - Active Input Switching: Seamlessly hot-swaps between keyboard and joystick at runtime.
  * 
  * HOW TO USE HARDWARE:
- * 1. Set `useSerial = true`
+ * 1. Set `serialEnabled = true`
  * 2. Ensure Arduino is printing string payloads: "X_VAL,Y_VAL,BUTTON_STATE\n"
  * 3. Match the Serial baud rate (9600 default).
  * 4. Both keyboard and joystick work simultaneously - last used input takes control.
@@ -19,17 +19,19 @@
  */
 import processing.serial.*;  // Handles Arduino/Joystick communication
 import processing.sound.*;   // Handles procedural audio generation
-boolean useSerial = true; // Enabled for IoT hardware presentation
+boolean serialEnabled = true; // Enabled for IoT hardware presentation
 
 Serial myPort;  // Serial port for joystick
 float playerX, playerY;  // Player position
 float playerSize = 40;   // Size of the player's aircraft
 int gameState = 0;       // 0 = Main Menu, 1 = Playing, 2 = Game Over
 int stateTransitionCooldown = 0; // Prevent instant restarts when spamming button
+int introStartTime;
 
 // --- Phase 1: Game State Variables ---
 int score = 0;
 int highScore = 0; // High score tracker
+boolean justSetNewHighScore = false; // Tracks whether the current run beat the previous record
 int lives = 3;
 int level = 1;
 int lastLevel = 1;      // To detect level up events
@@ -66,6 +68,35 @@ ArrayList<FloatingText> popups; // List of floating score popups
 int spawnTimer = 0;        // Timer for spawning enemies
 int playerMuzzleFlash = 0; // Frames to show bright gun flashes
 
+// Shared title-card helper so intro names all keep the same visual treatment.
+void drawNameColor(String name, float y, float speed, color col) {
+  float offset = sin(frameCount * speed) * 6;
+
+  fill(0, 0, 0, 120);
+  text(name, width / 2 + 2, y + offset + 2);
+
+  fill(col, 80);
+  text(name, width / 2, y + offset);
+
+  fill(col);
+  text(name, width / 2, y + offset);
+}
+
+// Prefer Arduino-like ports first so we do not accidentally grab a helper device.
+String findSerialPort() {
+  String[] ports = Serial.list();
+  for (String port : ports) {
+    String lowerPort = port.toLowerCase();
+    if (lowerPort.contains("ttyacm") || lowerPort.contains("ttyusb") || lowerPort.contains("usbmodem") || lowerPort.startsWith("com")) {
+      return port;
+    }
+  }
+  if (ports.length == 1) {
+    return ports[0];
+  }
+  return null;
+}
+
 /**
  * SETUP LOOP
  * Runs exactly once when the program starts. Initializes the window canvas,
@@ -75,21 +106,22 @@ int playerMuzzleFlash = 0; // Frames to show bright gun flashes
 void setup() {
   size(600, 600);  // Defines the application window resolution
 
-  if (useSerial) {
+  if (serialEnabled) {
     // Safety: Check that a serial port actually exists before attempting connection
     printArray(Serial.list()); // List all ports to console to help identify Arduino
-    if (Serial.list().length > 0) {
+    String selectedPort = findSerialPort();
+    if (selectedPort != null) {
       try {
-        myPort = new Serial(this, Serial.list()[0], 9600);
+        myPort = new Serial(this, selectedPort, 9600);
         myPort.bufferUntil('\n');
-        println("Serial connected on: " + Serial.list()[0]);
+        println("Serial connected on: " + selectedPort);
       } catch (Exception e) {
         println("ERROR: Could not open serial port (may be in use). Falling back to keyboard.");
-        useSerial = false;
+        serialEnabled = false;
       }
     } else {
       println("WARNING: No serial ports found. Falling back to keyboard mode.");
-      useSerial = false;
+      serialEnabled = false;
     }
   }
 
@@ -110,8 +142,10 @@ void setup() {
   }
 
   loadHighScore();   // Read from disk
+  // Build the gameplay state once so the intro can transition into a ready world.
   initializeGame();  // Initialize variables
-  gameState = 0;     // Force start at the main menu
+  introStartTime = millis();
+  gameState = -1;    // Start with the intro screen
 }
 
 /**
@@ -123,13 +157,61 @@ void setup() {
 void draw() {
   background(8, 12, 24);  // Deep navy blue space instead of flat black
 
+  if (gameState == -1) {
+    // Keep the intro isolated so it feels like a proper opening card, not a menu variant.
+    for (int i = 0; i < height; i++) {
+      float inter = map(i, 0, height, 0, 1);
+      float wave = sin(frameCount * 0.02 + i * 0.02) * 40;
+
+      stroke(
+        20 + inter * 80,
+        30 + inter * 120,
+        120 + inter * 100 + wave
+      );
+      line(0, i, width, i);
+    }
+
+    textAlign(CENTER, CENTER);
+
+    textSize(35);
+    fill(255);
+    text("SPACE DEFENDER", width / 2, height / 2 - 100);
+
+    textSize(18);
+    float baseY = height / 2;
+    drawNameColor("ABHAY KUMAR MAURYA", baseY + 20, 0.06, color(255, 120, 120));
+    drawNameColor("ADARSHIKA PANDEY", baseY - 40, 0.08, color(120, 255, 255));
+    drawNameColor("SHUBHI SAHU", baseY - 20, 0.09, color(255, 150, 255));
+    drawNameColor("PRATYUSH KUMAR NISHAD", baseY, 0.10, color(255, 255, 120));
+    drawNameColor("SHIVANSH SAXENA", baseY + 40, 0.07, color(120, 255, 120));
+    drawNameColor("UTKARSH SRIVASTAVA", baseY + 60, 0.08, color(120, 180, 255));
+    drawNameColor("SPARSH KOTIYA", baseY + 80, 0.09, color(255, 200, 150));
+    drawNameColor("MANMOHAN GUPTA", baseY + 100, 0.10, color(200, 255, 180));
+
+    float alpha = map(sin(frameCount * 0.1), -1, 1, 80, 255);
+    fill(255, 255, 100, alpha);
+    textSize(20);
+    text("PRESS ANY KEY TO SKIP", width / 2, height - 70);
+
+    int remaining = max(0, 5 - (millis() - introStartTime) / 1000);
+    fill(255, 255, 100, map(sin(frameCount * 0.1), -1, 1, 100, 255));
+    textSize(22);
+    text("Game will start in " + remaining + " sec...", width / 2, height - 40);
+
+    if (millis() - introStartTime > 5000) {
+      gameState = 0;
+    }
+
+    return;
+  }
+
   // Update and draw starfield behind everything
   for (Star s : stars) {
     s.update();
     s.show();
   }
 
-  // Decrement cooldowns BEFORE any early returns so they work on all screens
+  // Cooldowns tick before early returns so menu/game-over transitions cannot freeze them.
   if (stateTransitionCooldown > 0) stateTransitionCooldown--;
 
   // Handle Pause UI - Render early to skip gameplay logic
@@ -170,14 +252,14 @@ void draw() {
     line(width / 2 - 150, height / 2 - 15, width / 2 + 150, height / 2 - 15);
     noStroke();
     
-    // Controls - show both input methods
+    // Controls are shown together so players can switch to whichever device is available.
     fill(200);
     textSize(15);
     text("KEYBOARD: WASD / Arrows + SPACE to Shoot", width / 2, height / 2 + 5);
     fill(150, 255, 150);
     text("JOYSTICK: Analog Stick + Button to Shoot", width / 2, height / 2 + 28);
     
-    // Add pulsing effect for start text
+    // The pulse makes the call-to-action readable without adding new UI chrome.
     float pulse = map(sin(frameCount * 0.08), -1, 1, 80, 255);
     fill(255, 255, 100, pulse);
     textSize(26);
@@ -257,7 +339,7 @@ void draw() {
     text("FINAL SCORE: " + nf(score, 6), width / 2, height / 2 - 20);
     
     // NEW HIGH SCORE callout - only if score actually beat the record
-    if (score > 0 && score > highScore) {
+    if (justSetNewHighScore) {
       float glow = map(sin(frameCount * 0.15), -1, 1, 150, 255);
       fill(255, 200, 0, glow);
       textSize(22);
@@ -431,7 +513,9 @@ void draw() {
         screenShake = 15;
         invincibilityTimer = 90;
         if (lives <= 0) {
-          if (score > 0 && score > highScore) { highScore = score; saveHighScore(); }
+          boolean beatHighScore = score > 0 && score > highScore;
+          if (beatHighScore) { highScore = score; saveHighScore(); }
+          justSetNewHighScore = beatHighScore;
           gameState = 2; stateTransitionCooldown = 60;
         }
       }
@@ -450,7 +534,9 @@ void draw() {
         screenShake = 20;
         invincibilityTimer = 90;
         if (lives <= 0) {
-          if (score > 0 && score > highScore) { highScore = score; saveHighScore(); }
+          boolean beatHighScore = score > 0 && score > highScore;
+          if (beatHighScore) { highScore = score; saveHighScore(); }
+          justSetNewHighScore = beatHighScore;
           gameState = 2; stateTransitionCooldown = 60;
         }
       }
@@ -617,6 +703,13 @@ void drawCountdownOverlay() {
 
 // --- Keyboard input handlers ---
 void keyPressed() {
+  if (gameState == -1) {
+    gameState = 0;
+    introStartTime = millis();
+    stateTransitionCooldown = 30;
+    return;
+  }
+
   if (gameState == 0 && key == ' ' && stateTransitionCooldown <= 0) {
     initializeGame();
     return;
@@ -690,7 +783,7 @@ void keyReleased() {
  * - Game Over  (gameState 2): Button press = Restart Game
  */
 void serialEvent(Serial myPort) {
-  if (!useSerial) return;
+  if (!serialEnabled) return;
 
   String data = myPort.readStringUntil('\n');
   if (data == null) return;
@@ -712,6 +805,12 @@ void serialEvent(Serial myPort) {
       parsedY = constrain(parsedY, 0, 1023);
 
       // --- BUTTON MAPPING: Single button handles Start, Fire, and Restart ---
+      if (gameState == -1 && buttonState == 0) {
+        gameState = 0;
+        introStartTime = millis();
+        stateTransitionCooldown = 30;
+        return;
+      }
       // Menu: Button press starts the game
       if (gameState == 0 && buttonState == 0 && stateTransitionCooldown <= 0) {
         initializeGame();
@@ -724,9 +823,7 @@ void serialEvent(Serial myPort) {
       }
 
       if (gameState == 1) {
-        // --- JOYSTICK DEADZONE DETECTION for Active Input Switching ---
-        // If the stick is pushed away from center (512), switch to joystick mode.
-        // Deadzone prevents tiny analog drift from stealing control from keyboard.
+        // Deadzone avoids stick jitter stealing control when the joystick is resting.
         float joystickDeadzone = 30; // Adjust if your stick is loose/tight
         boolean stickMoved = (abs(parsedX - 512) > joystickDeadzone) || (abs(parsedY - 512) > joystickDeadzone);
         
@@ -745,8 +842,7 @@ void serialEvent(Serial myPort) {
           playerVX = playerX - oldX;
         }
 
-        // --- PAUSE TOGGLE via Joystick? (Optional: if the user holds stick still and presses button? No, let's stick to 'P') ---
-        // spaceHeld handles shooting but only if not paused
+        // Fire stays tied to the same shared flag so both input paths use one cooldown gate.
         if (!isPaused) spaceHeld = (buttonState == 0);
       }
     } catch (Exception e) {
@@ -775,13 +871,13 @@ void initializeGame() {
   spawnTimer    = 0;
   gameState     = 1;  // Set state to Playing
   shootCooldown = 0;
-  // Reset input and momentum vectors to prevent ghost-drifting if you restart while holding keys
+  // Clear transient input so a restart never inherits the previous run's movement state.
   spaceHeld = false;
   keyLeft = false; keyRight = false; keyUp = false; keyDown = false;
   playerVX = 0; playerVY = 0;
   usingJoystick = false; // Default to keyboard on fresh game start
   
-  // Reset all visual effect states to prevent carry-over between games
+  // Reset visual effects so the next run starts clean instead of reusing old damage cues.
   invincibilityTimer = 0;
   screenShake = 0;
   playerBank = 0;
@@ -789,6 +885,7 @@ void initializeGame() {
   
   // Phase 1 Resets
   score = 0;
+  justSetNewHighScore = false;
   lives = 3;
   level = 1;
   lastLevel = 1;
@@ -814,8 +911,12 @@ void loadHighScore() {
 }
 
 void saveHighScore() {
-  String[] lines = { str(highScore) };
-  saveStrings("data/highscore.txt", lines);
+  try {
+    String[] lines = { str(highScore) };
+    saveStrings("data/highscore.txt", lines);
+  } catch (Exception e) {
+    println("WARNING: Could not save high score: " + e.getMessage());
+  }
 }
 
 /**
@@ -846,6 +947,7 @@ void createExplosion(float ex, float ey) {
  * to ensure organic, unpredictable bullet patterns across multiple entities.
  */
 class Enemy {
+  float x, y, size;
   float speed;
   int shootOffset; // For desynchronized shooting
   int flashTimer = 0; // Visual feedback when hit
